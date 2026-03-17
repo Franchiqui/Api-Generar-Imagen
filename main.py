@@ -9,11 +9,12 @@ import uuid
 
 app = FastAPI()
 
-# --- CONFIGURACIÓN DE POCKETBASE ---
-# Puedes cambiar esta URL por la de tu instancia de PocketBase
+# --- CONFIGURACIÓN ---
 POCKETBASE_URL = "https://zeus-media-studio-ia.fly.dev" 
 POCKETBASE_COLLECTION = "imagen_generada"
-# ----------------------------------
+# URL de Hugging Face para FLUX.1-schnell (puedes cambiarlo por /FLUX.1-dev si prefieres)
+FLUX_API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+# ---------------------
 
 # Configuración de CORS
 app.add_middleware(
@@ -30,73 +31,76 @@ def read_root():
 
 @app.post("/test_generate_and_proxy/")
 async def test_generate_and_proxy(
-    api_key: str = Form(...),
-    model: str = Form("dall-e-3"),
+    api_key: str = Form(...), # API Key de OpenAI o Access Token de Hugging Face
+    model: str = Form("dall-e-3"), # "dall-e-2", "dall-e-3" o "flux"
     prompt: str = Form(...),
     n: int = Form(1),
     size: str = Form("1024x1024")
 ):
     try:
-        client_openai = OpenAI(api_key=api_key)
-        
-        actual_n = n
-        if model == "dall-e-3":
-            actual_n = 1
+        image_bytes_list = []
 
-        response = client_openai.images.generate(
-            model=model,
-            prompt=prompt,
-            n=actual_n,
-            size=size
-        )
-        
-        if not response.data:
-            raise HTTPException(status_code=400, detail="Failed to generate images.")
-        
-        images = [data.url for data in response.data]
-        image_urls = []
-        
+        # --- LÓGICA SEGÚN EL MODELO ---
+        if "flux" in model.lower():
+            # Hugging Face Inference API
+            headers = {"Authorization": f"Bearer {api_key}"}
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(FLUX_API_URL, headers=headers, json={"inputs": prompt})
+                if response.status_code != 200:
+                    raise HTTPException(status_code=response.status_code, detail=f"Hugging Face Error: {response.text}")
+                image_bytes_list.append(response.content)
+        else:
+            # OpenAI API (DALL-E)
+            client_openai = OpenAI(api_key=api_key)
+            actual_n = 1 if model == "dall-e-3" else n
+            
+            response = client_openai.images.generate(
+                model=model,
+                prompt=prompt,
+                n=actual_n,
+                size=size
+            )
+            
+            if not response.data:
+                raise HTTPException(status_code=400, detail="Failed to generate images with OpenAI.")
+            
+            # Descargar imágenes de OpenAI para subirlas a PocketBase
+            async with httpx.AsyncClient() as client:
+                for data in response.data:
+                    img_res = await client.get(data.url)
+                    if img_res.status_code == 200:
+                        image_bytes_list.append(img_res.content)
+                    else:
+                        raise HTTPException(status_code=img_res.status_code, detail="Error fetching image from OpenAI")
+
+        # --- SUBIDA COMÚN A POCKETBASE ---
+        final_image_urls = []
+        if not image_bytes_list:
+            raise HTTPException(status_code=404, detail="No images were generated")
+
         async with httpx.AsyncClient() as client:
-            for image_url in images:
-                # Descargar la imagen de OpenAI
-                proxy_response = await client.get(image_url)
-                if proxy_response.status_code == 200:
-                    content = proxy_response.content
-                    image = Image.open(BytesIO(content))
+            for content in image_bytes_list:
+                image = Image.open(BytesIO(content))
+                img_io = BytesIO()
+                image.save(img_io, format='JPEG')
+                img_io.seek(0)
 
-                    # Preparar la imagen para subirla
-                    img_bytes = BytesIO()
-                    image.save(img_bytes, format='JPEG')
-                    img_bytes.seek(0)
+                files = {'imagen': ('generated_image.jpg', img_io, 'image/jpeg')}
+                upload_url = f"{POCKETBASE_URL}/api/collections/{POCKETBASE_COLLECTION}/records"
+                
+                upload_res = await client.post(upload_url, files=files)
+                if upload_res.status_code != 200:
+                    raise HTTPException(status_code=upload_res.status_code, detail=f"PocketBase upload error: {upload_res.text}")
 
-                    # PocketBase usa el campo "imagen" según tu esquema
-                    files = {
-                        'imagen': ('generated_image.jpg', img_bytes, 'image/jpeg')
-                    }
+                res_json = upload_res.json()
+                record_id = res_json['id']
+                filename = res_json['imagen']
+                coll_id = res_json['collectionId']
 
-                    # Enviar a PocketBase
-                    upload_url = f"{POCKETBASE_URL}/api/collections/{POCKETBASE_COLLECTION}/records"
-                    upload_response = await client.post(upload_url, files=files)
-                    
-                    if upload_response.status_code != 200:
-                        raise HTTPException(status_code=upload_response.status_code, detail=f"PocketBase error: {upload_response.text}")
+                pb_url = f"{POCKETBASE_URL}/api/files/{coll_id}/{record_id}/{filename}"
+                final_image_urls.append({"id": record_id, "url": pb_url})
 
-                    res_json = upload_response.json()
-                    record_id = res_json['id']
-                    filename = res_json['imagen']
-                    collection_id = res_json['collectionId']
-
-                    # Construir la URL pública de la imagen en PocketBase
-                    pb_image_url = f"{POCKETBASE_URL}/api/files/{collection_id}/{record_id}/{filename}"
-                    
-                    image_urls.append({
-                        "id": record_id,
-                        "url": pb_image_url
-                    })
-                else:
-                    raise HTTPException(status_code=proxy_response.status_code, detail="Error fetching image from OpenAI")
-
-        return {"images": image_urls}
+        return {"images": final_image_urls}
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
