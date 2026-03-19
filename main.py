@@ -107,8 +107,8 @@ async def test_generate_and_proxy(
 @app.post("/flux/")
 async def flux(
     prompt: str = Form(...),
-    image_file: UploadFile = File(None),  # Opcional: si viene, edita; si no, genera
-    mask_file: UploadFile = File(None),
+    image_file: UploadFile = File(None),
+    mask_file: UploadFile = File(None),  # Por ahora no se usa
     strength: float = Form(0.8),
     seed: int = Form(42),
     steps: int = Form(4),
@@ -118,11 +118,6 @@ async def flux(
     height: int = Form(1024),
     comfyui_url: str = Form("http://127.0.0.1:8188"),
 ):
-    """
-    Endpoint INTELIGENTE: 
-    - Si envías image_file → EDITA la imagen
-    - Si NO envías image_file → GENERA desde texto
-    """
     try:
         # --- 1. VERIFICAR CONEXIÓN ---
         async with aiohttp.ClientSession() as session:
@@ -148,56 +143,54 @@ async def flux(
             if cfg != 1.0:
                 cfg = 1.0
         
-        print(f"📌 Usando modelo: {model_name}")
-        print(f"📌 Modo: {'EDICIÓN' if image_file else 'GENERACIÓN'}")
+        modo = "GENERACIÓN" if image_file is None else "EDICIÓN"
+        print(f"📌 Modo: {modo}")
+        print(f"📌 Modelo: {model_name}")
         
-        # --- 3. PREPARAR WORKFLOW (según si hay imagen o no) ---
-        
-        # Nodos base (comunes a ambos modos)
+        # --- 3. WORKFLOW BASE ---
         workflow = {
-            "2": {
+            "clip": {
                 "class_type": "CLIPLoader",
                 "inputs": {
                     "clip_name": "qwen_3_4b.safetensors",
                     "type": "flux2"
                 }
             },
-            "3": {
+            "unet": {
                 "class_type": "UNETLoader",
                 "inputs": {
                     "unet_name": model_name,
                     "weight_dtype": "fp8_e4m3fn"
                 }
             },
-            "4": {
+            "vae": {
                 "class_type": "VAELoader",
                 "inputs": {
                     "vae_name": "flux2-vae.safetensors"
                 }
             },
-            "5": {
+            "positive": {
                 "class_type": "CLIPTextEncode",
                 "inputs": {
                     "text": prompt,
-                    "clip": ["2", 0]
+                    "clip": ["clip", 0]
                 }
             },
-            "6": {
+            "negative": {
                 "class_type": "CLIPTextEncode",
                 "inputs": {
                     "text": "",
-                    "clip": ["2", 0]
+                    "clip": ["clip", 0]
                 }
             }
         }
         
-        # MODO 1: GENERACIÓN (sin imagen)
-        if not image_file:
-            # Asegurar múltiplos de 16
+        # --- 4. MODO GENERACIÓN ---
+        if image_file is None:
             width = (width // 16) * 16
             height = (height // 16) * 16
             
-            workflow["1"] = {
+            workflow["latent"] = {
                 "class_type": "EmptyLatentImage",
                 "inputs": {
                     "width": width,
@@ -206,7 +199,7 @@ async def flux(
                 }
             }
             
-            workflow["7"] = {
+            workflow["sampler"] = {
                 "class_type": "KSampler",
                 "inputs": {
                     "seed": seed,
@@ -215,35 +208,36 @@ async def flux(
                     "sampler_name": "euler",
                     "scheduler": "simple",
                     "denoise": 1.0,
-                    "model": ["3", 0],
-                    "positive": ["5", 0],
-                    "negative": ["6", 0],
-                    "latent_image": ["1", 0]
+                    "model": ["unet", 0],
+                    "positive": ["positive", 0],
+                    "negative": ["negative", 0],
+                    "latent_image": ["latent", 0]
                 }
             }
             
             print(f"📏 Generando: {width}x{height}")
         
-        # MODO 2: EDICIÓN (con imagen)
+        # --- 5. MODO EDICIÓN (VERSIÓN SIMPLE) ---
         else:
             # Leer imagen
             image_content = await image_file.read()
             if len(image_content) == 0:
                 raise HTTPException(status_code=400, detail="La imagen está vacía")
             
-            # Guardar imagen temporal
+            # Crear directorio temporal
             temp_dir = "C:\\temp\\comfyui_uploads"
             if not os.path.exists(temp_dir):
                 os.makedirs(temp_dir)
             
             temp_image_path = os.path.join(temp_dir, f"input_{uuid.uuid4()}.png")
             
+            # Procesar imagen
             try:
                 image = Image.open(BytesIO(image_content))
                 if image.mode != 'RGB':
                     image = image.convert('RGB')
                 
-                # Redimensionar manteniendo proporción
+                # Redimensionar si es necesario
                 max_size = 1024
                 if image.width > max_size or image.height > max_size:
                     image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
@@ -260,22 +254,27 @@ async def flux(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Error al procesar imagen: {str(e)}")
             
-            workflow["1"] = {
+            workflow["load_image"] = {
                 "class_type": "LoadImage",
                 "inputs": {
                     "image": temp_image_path
                 }
             }
             
-            workflow["7"] = {
+            # VERSIÓN SIMPLE: VAEEncode normal (sin máscara)
+            workflow["encode"] = {
                 "class_type": "VAEEncode",
                 "inputs": {
-                    "pixels": ["1", 0],
-                    "vae": ["4", 0]
+                    "pixels": ["load_image", 0],
+                    "vae": ["vae", 0]
                 }
             }
             
-            workflow["8"] = {
+            # Si hay máscara, solo avisamos pero no la usamos
+            if mask_file:
+                print("⚠️ Las máscaras están desactivadas. Editando imagen completa.")
+            
+            workflow["sampler"] = {
                 "class_type": "KSampler",
                 "inputs": {
                     "seed": seed,
@@ -284,64 +283,31 @@ async def flux(
                     "sampler_name": "euler",
                     "scheduler": "simple",
                     "denoise": strength,
-                    "model": ["3", 0],
-                    "positive": ["5", 0],
-                    "negative": ["6", 0],
-                    "latent_image": ["7", 0]
+                    "model": ["unet", 0],
+                    "positive": ["positive", 0],
+                    "negative": ["negative", 0],
+                    "latent_image": ["encode", 0]
                 }
             }
-            
-            # Máscara (opcional)
-            if mask_file:
-                mask_content = await mask_file.read()
-                if len(mask_content) > 0:
-                    try:
-                        mask = Image.open(BytesIO(mask_content))
-                        mask = mask.convert('L')
-                        if mask.size != (width, height):
-                            mask = mask.resize((width, height), Image.Resampling.LANCZOS)
-                        
-                        mask_path = os.path.join(temp_dir, f"mask_{uuid.uuid4()}.png")
-                        mask.save(mask_path, format="PNG")
-                        
-                        workflow["9"] = {
-                            "class_type": "LoadImage",
-                            "inputs": {
-                                "image": mask_path
-                            }
-                        }
-                        workflow["10"] = {
-                            "class_type": "VAEEncodeForInpaint",
-                            "inputs": {
-                                "pixels": ["1", 0],
-                                "vae": ["4", 0],
-                                "mask": ["9", 0],
-                                "grow_mask_by": 6
-                            }
-                        }
-                        workflow["8"]["inputs"]["latent_image"] = ["10", 0]
-                        print("✅ Máscara aplicada")
-                    except Exception as e:
-                        print(f"⚠️ Error con máscara: {e}")
         
-        # Nodos comunes finales
-        workflow["9"] = {
+        # --- 6. NODOS FINALES ---
+        workflow["decode"] = {
             "class_type": "VAEDecode",
             "inputs": {
-                "samples": ["7" if not image_file else "8", 0],
-                "vae": ["4", 0]
+                "samples": ["sampler", 0],
+                "vae": ["vae", 0]
             }
         }
         
-        workflow["10"] = {
+        workflow["save"] = {
             "class_type": "SaveImage",
             "inputs": {
                 "filename_prefix": "flux_output",
-                "images": ["9", 0]
+                "images": ["decode", 0]
             }
         }
         
-        # --- 4. ENVIAR A COMFYUI ---
+        # --- 7. ENVIAR A COMFYUI ---
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{comfyui_url}/prompt",
@@ -350,16 +316,13 @@ async def flux(
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Error de ComfyUI: {error_text[:500]}"
-                    )
+                    raise HTTPException(status_code=400, detail=f"Error: {error_text[:500]}")
                 
                 result = await resp.json()
                 prompt_id = result["prompt_id"]
                 print(f"✅ Prompt ID: {prompt_id}")
             
-            # --- 5. ESPERAR RESULTADO ---
+            # --- 8. ESPERAR RESULTADO ---
             max_attempts = 60
             image_bytes = None
             
@@ -395,16 +358,14 @@ async def flux(
             if not image_bytes:
                 raise HTTPException(status_code=504, detail="Timeout")
         
-        # --- 6. LIMPIAR TEMPORALES (si hay) ---
+        # --- 9. LIMPIAR ARCHIVOS TEMPORALES ---
         if image_file and 'temp_image_path' in locals():
             try:
                 os.remove(temp_image_path)
-                if mask_file and 'mask_path' in locals():
-                    os.remove(mask_path)
             except:
                 pass
         
-        # --- 7. SUBIR A POCKETBASE ---
+        # --- 10. SUBIR A POCKETBASE ---
         final_image = Image.open(BytesIO(image_bytes))
         img_io = BytesIO()
         final_image.save(img_io, format='JPEG', quality=95)
@@ -417,20 +378,26 @@ async def flux(
                 files=files_pb
             )
             
+            if upload_res.status_code != 200:
+                raise HTTPException(
+                    status_code=upload_res.status_code,
+                    detail=f"Error subiendo a PocketBase: {upload_res.text}"
+                )
+            
             res_json = upload_res.json()
             pb_url = f"{POCKETBASE_URL}/api/files/{res_json['collectionId']}/{res_json['id']}/{res_json['imagen']}"
         
         return {
             "success": True,
-            "message": "Imagen procesada exitosamente",
-            "mode": "edición" if image_file else "generación",
+            "message": f"Imagen {modo.lower()} exitosamente",
+            "mode": modo.lower(),
             "image": {
                 "id": res_json['id'],
                 "url": pb_url
             },
-            "model_used": model_name,
             "parameters": {
                 "prompt": prompt,
+                "model": model_name,
                 "steps": steps,
                 "cfg": cfg,
                 "seed": seed
