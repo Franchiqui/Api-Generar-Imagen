@@ -104,20 +104,24 @@ async def test_generate_and_proxy(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ===== NUEVO ENDPOINT PARA FLUX.2 KLEIN =====
-@app.post("/edit_with_comfyui_flux/")
-async def edit_with_comfyui_flux(
+@app.post("/flux/")
+async def flux(
     prompt: str = Form(...),
-    image_file: UploadFile = File(...),
+    image_file: UploadFile = File(None),  # Opcional: si viene, edita; si no, genera
     mask_file: UploadFile = File(None),
     strength: float = Form(0.8),
     seed: int = Form(42),
     steps: int = Form(4),
     cfg: float = Form(1.0),
     use_base_model: bool = Form(False),
+    width: int = Form(1024),
+    height: int = Form(1024),
     comfyui_url: str = Form("http://127.0.0.1:8188"),
 ):
     """
-    Edita una imagen usando FLUX.2 Klein con la estructura correcta de carpetas
+    Endpoint INTELIGENTE: 
+    - Si envías image_file → EDITA la imagen
+    - Si NO envías image_file → GENERA desde texto
     """
     try:
         # --- 1. VERIFICAR CONEXIÓN ---
@@ -130,7 +134,7 @@ async def edit_with_comfyui_flux(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"No se puede conectar a ComfyUI: {str(e)}")
         
-        # --- 2. SELECCIONAR MODELO (desde unet/) ---
+        # --- 2. SELECCIONAR MODELO ---
         if use_base_model:
             model_name = "flux-2-klein-base-4b.safetensors"
             if steps == 4:
@@ -144,83 +148,31 @@ async def edit_with_comfyui_flux(
             if cfg != 1.0:
                 cfg = 1.0
         
-        print(f"📌 Usando modelo UNET: {model_name}")
-        print(f"📌 Parámetros: steps={steps}, cfg={cfg}, strength={strength}")
+        print(f"📌 Usando modelo: {model_name}")
+        print(f"📌 Modo: {'EDICIÓN' if image_file else 'GENERACIÓN'}")
         
-        # --- 3. PREPARAR IMAGEN ---
-        image_content = await image_file.read()
-        if len(image_content) == 0:
-            raise HTTPException(status_code=400, detail="La imagen está vacía")
+        # --- 3. PREPARAR WORKFLOW (según si hay imagen o no) ---
         
-        temp_dir = "C:\\temp\\comfyui_uploads"
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
-        
-        temp_image_path = os.path.join(temp_dir, f"input_{uuid.uuid4()}.png")
-        
-        try:
-            image = Image.open(BytesIO(image_content))
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            max_size = 1024
-            if image.width > max_size or image.height > max_size:
-                image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            
-            width = (image.width // 16) * 16
-            height = (image.height // 16) * 16
-            if width != image.width or height != image.height:
-                image = image.resize((width, height), Image.Resampling.LANCZOS)
-            
-            print(f"📏 Imagen: {image.width}x{image.height}")
-            image.save(temp_image_path, format="PNG")
-            
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error al procesar imagen: {str(e)}")
-        
-        # --- 4. PREPARAR MÁSCARA ---
-        mask_path = None
-        if mask_file:
-            mask_content = await mask_file.read()
-            if len(mask_content) > 0:
-                try:
-                    mask = Image.open(BytesIO(mask_content))
-                    mask = mask.convert('L')
-                    if mask.size != (image.width, image.height):
-                        mask = mask.resize((image.width, image.height), Image.Resampling.LANCZOS)
-                    
-                    mask_path = os.path.join(temp_dir, f"mask_{uuid.uuid4()}.png")
-                    mask.save(mask_path, format="PNG")
-                    print("✅ Máscara cargada")
-                except Exception as e:
-                    print(f"⚠️ Error con máscara: {e}")
-        
-        # --- 5. WORKFLOW CORREGIDO ---
+        # Nodos base (comunes a ambos modos)
         workflow = {
-            "1": {
-                "class_type": "LoadImage",
-                "inputs": {
-                    "image": temp_image_path
-                }
-            },
             "2": {
                 "class_type": "CLIPLoader",
                 "inputs": {
                     "clip_name": "qwen_3_4b.safetensors",
-                    "type": "flux2"  # ¡IMPORTANTE: flux2, no flux!
+                    "type": "flux2"
                 }
             },
             "3": {
                 "class_type": "UNETLoader",
                 "inputs": {
-                    "unet_name": model_name,  # Ahora buscará en unet/
+                    "unet_name": model_name,
                     "weight_dtype": "fp8_e4m3fn"
                 }
             },
             "4": {
                 "class_type": "VAELoader",
                 "inputs": {
-                    "vae_name": "flux2-vae.safetensors"  # Buscará en vae/
+                    "vae_name": "flux2-vae.safetensors"
                 }
             },
             "5": {
@@ -236,15 +188,94 @@ async def edit_with_comfyui_flux(
                     "text": "",
                     "clip": ["2", 0]
                 }
-            },
-            "7": {
+            }
+        }
+        
+        # MODO 1: GENERACIÓN (sin imagen)
+        if not image_file:
+            # Asegurar múltiplos de 16
+            width = (width // 16) * 16
+            height = (height // 16) * 16
+            
+            workflow["1"] = {
+                "class_type": "EmptyLatentImage",
+                "inputs": {
+                    "width": width,
+                    "height": height,
+                    "batch_size": 1
+                }
+            }
+            
+            workflow["7"] = {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": seed,
+                    "steps": steps,
+                    "cfg": cfg,
+                    "sampler_name": "euler",
+                    "scheduler": "simple",
+                    "denoise": 1.0,
+                    "model": ["3", 0],
+                    "positive": ["5", 0],
+                    "negative": ["6", 0],
+                    "latent_image": ["1", 0]
+                }
+            }
+            
+            print(f"📏 Generando: {width}x{height}")
+        
+        # MODO 2: EDICIÓN (con imagen)
+        else:
+            # Leer imagen
+            image_content = await image_file.read()
+            if len(image_content) == 0:
+                raise HTTPException(status_code=400, detail="La imagen está vacía")
+            
+            # Guardar imagen temporal
+            temp_dir = "C:\\temp\\comfyui_uploads"
+            if not os.path.exists(temp_dir):
+                os.makedirs(temp_dir)
+            
+            temp_image_path = os.path.join(temp_dir, f"input_{uuid.uuid4()}.png")
+            
+            try:
+                image = Image.open(BytesIO(image_content))
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                
+                # Redimensionar manteniendo proporción
+                max_size = 1024
+                if image.width > max_size or image.height > max_size:
+                    image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                
+                # Asegurar múltiplos de 16
+                width = (image.width // 16) * 16
+                height = (image.height // 16) * 16
+                if width != image.width or height != image.height:
+                    image = image.resize((width, height), Image.Resampling.LANCZOS)
+                
+                image.save(temp_image_path, format="PNG")
+                print(f"📏 Imagen: {width}x{height}")
+                
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error al procesar imagen: {str(e)}")
+            
+            workflow["1"] = {
+                "class_type": "LoadImage",
+                "inputs": {
+                    "image": temp_image_path
+                }
+            }
+            
+            workflow["7"] = {
                 "class_type": "VAEEncode",
                 "inputs": {
                     "pixels": ["1", 0],
                     "vae": ["4", 0]
                 }
-            },
-            "8": {
+            }
+            
+            workflow["8"] = {
                 "class_type": "KSampler",
                 "inputs": {
                     "seed": seed,
@@ -258,45 +289,60 @@ async def edit_with_comfyui_flux(
                     "negative": ["6", 0],
                     "latent_image": ["7", 0]
                 }
-            },
-            "9": {
-                "class_type": "VAEDecode",
-                "inputs": {
-                    "samples": ["8", 0],
-                    "vae": ["4", 0]
-                }
-            },
-            "10": {
-                "class_type": "SaveImage",
-                "inputs": {
-                    "filename_prefix": "flux_output",
-                    "images": ["9", 0]
-                }
+            }
+            
+            # Máscara (opcional)
+            if mask_file:
+                mask_content = await mask_file.read()
+                if len(mask_content) > 0:
+                    try:
+                        mask = Image.open(BytesIO(mask_content))
+                        mask = mask.convert('L')
+                        if mask.size != (width, height):
+                            mask = mask.resize((width, height), Image.Resampling.LANCZOS)
+                        
+                        mask_path = os.path.join(temp_dir, f"mask_{uuid.uuid4()}.png")
+                        mask.save(mask_path, format="PNG")
+                        
+                        workflow["9"] = {
+                            "class_type": "LoadImage",
+                            "inputs": {
+                                "image": mask_path
+                            }
+                        }
+                        workflow["10"] = {
+                            "class_type": "VAEEncodeForInpaint",
+                            "inputs": {
+                                "pixels": ["1", 0],
+                                "vae": ["4", 0],
+                                "mask": ["9", 0],
+                                "grow_mask_by": 6
+                            }
+                        }
+                        workflow["8"]["inputs"]["latent_image"] = ["10", 0]
+                        print("✅ Máscara aplicada")
+                    except Exception as e:
+                        print(f"⚠️ Error con máscara: {e}")
+        
+        # Nodos comunes finales
+        workflow["9"] = {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": ["7" if not image_file else "8", 0],
+                "vae": ["4", 0]
             }
         }
         
-        if mask_path:
-            workflow["11"] = {
-                "class_type": "LoadImage",
-                "inputs": {
-                    "image": mask_path
-                }
+        workflow["10"] = {
+            "class_type": "SaveImage",
+            "inputs": {
+                "filename_prefix": "flux_output",
+                "images": ["9", 0]
             }
-            workflow["12"] = {
-                "class_type": "VAEEncodeForInpaint",
-                "inputs": {
-                    "pixels": ["1", 0],
-                    "vae": ["4", 0],
-                    "mask": ["11", 0],
-                    "grow_mask_by": 6
-                }
-            }
-            workflow["8"]["inputs"]["latent_image"] = ["12", 0]
+        }
         
-        # --- 6. ENVIAR A COMFYUI ---
+        # --- 4. ENVIAR A COMFYUI ---
         async with aiohttp.ClientSession() as session:
-            print("🚀 Enviando a ComfyUI...")
-            
             async with session.post(
                 f"{comfyui_url}/prompt",
                 json={"prompt": workflow},
@@ -304,7 +350,6 @@ async def edit_with_comfyui_flux(
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    print(f"❌ Error: {error_text}")
                     raise HTTPException(
                         status_code=400,
                         detail=f"Error de ComfyUI: {error_text[:500]}"
@@ -314,13 +359,13 @@ async def edit_with_comfyui_flux(
                 prompt_id = result["prompt_id"]
                 print(f"✅ Prompt ID: {prompt_id}")
             
-            # --- 7. ESPERAR RESULTADO ---
+            # --- 5. ESPERAR RESULTADO ---
             max_attempts = 60
-            edited_image_bytes = None
+            image_bytes = None
             
             for attempt in range(max_attempts):
-                print(f"⏳ Intento {attempt+1}/{max_attempts}")
                 await asyncio.sleep(2)
+                print(f"⏳ Intento {attempt+1}/{max_attempts}")
                 
                 async with session.get(f"{comfyui_url}/history/{prompt_id}") as resp:
                     if resp.status == 200:
@@ -341,50 +386,54 @@ async def edit_with_comfyui_flux(
                                         }
                                     ) as img_resp:
                                         if img_resp.status == 200:
-                                            edited_image_bytes = await img_resp.read()
-                                            print("✅ Imagen generada")
+                                            image_bytes = await img_resp.read()
+                                            print("✅ Imagen lista")
                                             break
-                            if edited_image_bytes:
+                            if image_bytes:
                                 break
             
-            if not edited_image_bytes:
-                raise HTTPException(status_code=504, detail="Timeout: ComfyUI no generó la imagen")
+            if not image_bytes:
+                raise HTTPException(status_code=504, detail="Timeout")
         
-        # --- 8. LIMPIAR Y SUBIR ---
-        try:
-            os.remove(temp_image_path)
-            if mask_path:
-                os.remove(mask_path)
-        except:
-            pass
+        # --- 6. LIMPIAR TEMPORALES (si hay) ---
+        if image_file and 'temp_image_path' in locals():
+            try:
+                os.remove(temp_image_path)
+                if mask_file and 'mask_path' in locals():
+                    os.remove(mask_path)
+            except:
+                pass
         
-        edited_image = Image.open(BytesIO(edited_image_bytes))
+        # --- 7. SUBIR A POCKETBASE ---
+        final_image = Image.open(BytesIO(image_bytes))
         img_io = BytesIO()
-        edited_image.save(img_io, format='JPEG', quality=95)
+        final_image.save(img_io, format='JPEG', quality=95)
         img_io.seek(0)
         
         async with httpx.AsyncClient() as client_pb:
-            files_pb = {'imagen': ('edited_image.jpg', img_io, 'image/jpeg')}
+            files_pb = {'imagen': ('flux_image.jpg', img_io, 'image/jpeg')}
             upload_res = await client_pb.post(
                 f"{POCKETBASE_URL}/api/collections/{POCKETBASE_COLLECTION}/records",
                 files=files_pb
             )
-            
-            if upload_res.status_code != 200:
-                raise HTTPException(
-                    status_code=upload_res.status_code,
-                    detail=f"Error subiendo a PocketBase: {upload_res.text}"
-                )
             
             res_json = upload_res.json()
             pb_url = f"{POCKETBASE_URL}/api/files/{res_json['collectionId']}/{res_json['id']}/{res_json['imagen']}"
         
         return {
             "success": True,
-            "message": "Imagen editada exitosamente",
-            "edited_image": {
+            "message": "Imagen procesada exitosamente",
+            "mode": "edición" if image_file else "generación",
+            "image": {
                 "id": res_json['id'],
                 "url": pb_url
+            },
+            "model_used": model_name,
+            "parameters": {
+                "prompt": prompt,
+                "steps": steps,
+                "cfg": cfg,
+                "seed": seed
             }
         }
         
